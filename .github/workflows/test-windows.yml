@@ -41,7 +41,12 @@ jobs:
       - name: Verify the server extension loads
         run: |
           jupyter server extension list
-          jupyter server extension list 2>&1 | Select-String -Pattern "jupyter_ai_acp_client.*OK" -Quiet
+          # Select-String -Quiet returns a boolean; it does not set an exit
+          # code, so the failure has to be raised explicitly.
+          if (-not (jupyter server extension list 2>&1 |
+                    Select-String -Pattern "jupyter_ai_acp_client.*OK" -Quiet)) {
+            throw "server extension did not report OK"
+          }
 
       # Guards the two independent Windows defects end to end, against a real
       # npm-installed `.cmd` shim rather than a mock:
