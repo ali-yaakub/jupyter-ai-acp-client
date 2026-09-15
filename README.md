@@ -136,9 +136,9 @@ the same lookup the extension performs:
 python -c "import shutil; print(shutil.which('claude-agent-acp'))"
 ```
 
-An empty result means the adapter is not on `PATH`; reinstall it with
-`npm install -g @agentclientprotocol/claude-agent-acp` and restart JupyterLab so
-the server picks up the new `PATH`.
+An empty result means the adapter is not on `PATH`. Reinstall it using the
+command listed for that persona above, then restart JupyterLab so the server
+picks up the new `PATH`.
 
 ## Troubleshoot
 
@@ -172,7 +172,8 @@ The `jlpm` command is JupyterLab's pinned version of
 
 # Set up a virtual environment and install package in development mode
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # macOS/Linux
+.venv\Scripts\activate      # Windows
 pip install --editable ".[dev,test]"
 
 # Link your development version of the extension with JupyterLab

@@ -153,6 +153,7 @@ class _WriteTransport(asyncio.WriteTransport):
     """
 
     def __init__(self, pipe: Any) -> None:
+        """Start the writer thread that owns *pipe*."""
         super().__init__()
         self._pipe = pipe
         self._queue: queue.Queue[Optional[bytes]] = queue.Queue()
@@ -163,6 +164,13 @@ class _WriteTransport(asyncio.WriteTransport):
         self._thread.start()
 
     def _drain(self) -> None:
+        """
+        Writer thread: block on the queue and write to the pipe.
+
+        A `None` sentinel means the transport was closed. The pipe is
+        closed here rather than in `close()` so that any writes already
+        queued are flushed to the agent first.
+        """
         while True:
             data = self._queue.get()
             if data is None:
@@ -179,24 +187,35 @@ class _WriteTransport(asyncio.WriteTransport):
             pass
 
     def write(self, data: bytes) -> None:
+        """Queue *data* for the writer thread. Never blocks the loop."""
         if not self._closing:
             self._queue.put(bytes(data))
 
     def can_write_eof(self) -> bool:
+        """Half-closing a Windows pipe is not supported."""
         return False
 
     def is_closing(self) -> bool:
+        """Whether `close()` has been called."""
         return self._closing
 
     def close(self) -> None:
+        """Stop accepting writes and let the writer thread drain and exit."""
         if not self._closing:
             self._closing = True
             self._queue.put(None)
 
     def abort(self) -> None:
+        """
+        Close the transport.
+
+        There is no faster path than `close()` here: the pipe belongs to
+        the writer thread, so discarding queued data would race with it.
+        """
         self.close()
 
     def get_extra_info(self, name: str, default: Any = None) -> Any:
+        """No socket or pipe details are exposed; always the default."""
         return default
 
 
@@ -217,6 +236,7 @@ class WindowsProcess:
         *,
         limit: int = DEFAULT_STREAM_LIMIT,
     ) -> None:
+        """Wrap *popen*, bridging its pipes onto *loop*."""
         self._popen = popen
         self._loop = loop
         self._wait_future: Optional[asyncio.Future] = None
@@ -256,24 +276,44 @@ class WindowsProcess:
 
     @property
     def stdin(self) -> Optional[asyncio.StreamWriter]:
+        """The agent's stdin, or None when it was not piped."""
         return self._stdin
 
     @property
     def stdout(self) -> Optional[asyncio.StreamReader]:
+        """The agent's stdout, or None when it was not piped."""
         return self._stdout
 
     @property
     def stderr(self) -> Optional[asyncio.StreamReader]:
+        """
+        Always None.
+
+        This package either inherits stderr or merges it into stdout, so
+        there is never a separate stream to expose.
+        """
         return self._stderr
 
     @property
     def pid(self) -> int:
+        """
+        The direct child's pid.
+
+        For an npm shim this is `cmd.exe`, not the agent itself, which is
+        why termination has to walk the process tree.
+        """
         return self._popen.pid
 
     @property
     def returncode(self) -> Optional[int]:
-        # `Popen.returncode` is only populated by poll()/wait(); poll here so
-        # callers that gate on `returncode is None` see the truth.
+        """
+        The direct child's exit code, or None while it is still running.
+
+        `Popen.returncode` is only populated by `poll()`/`wait()`, so this
+        polls rather than reading the attribute: callers gate cleanup on
+        `returncode is None` and would otherwise never see an exit they did
+        not themselves wait for.
+        """
         return self._popen.poll()
 
     async def wait(self) -> int:
@@ -283,9 +323,20 @@ class WindowsProcess:
         return await asyncio.shield(self._wait_future)
 
     def terminate(self) -> None:
+        """
+        Terminate the direct child only.
+
+        Prefer `terminate_process()`, which kills the whole tree: ending
+        an npm shim here would orphan the agent running beneath it.
+        """
         self._popen.terminate()
 
     def kill(self) -> None:
+        """
+        Kill the direct child only.
+
+        Carries the same caveat as `terminate()`.
+        """
         self._popen.kill()
 
 
