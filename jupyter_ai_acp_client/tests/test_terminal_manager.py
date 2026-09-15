@@ -7,7 +7,7 @@ Covers:
   - Terminal count limit (MAX_TERMINALS)
   - Denied environment variables (_DENIED_ENV_VARS)
   - Default output byte limit (DEFAULT_OUTPUT_BYTE_LIMIT)
-  - Process group kill (os.killpg with fallback)
+  - Process tree kill (platform-aware, via kill_process_tree)
   - Cleanup session logging
   - Race-safe terminal_output exit status
 """
@@ -31,6 +31,20 @@ from jupyter_ai_acp_client.terminal_manager import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _signame(signum: int) -> str:
+    """
+    The name `_set_exit_status` will produce for *signum* on this platform.
+
+    Signal names are a POSIX concept: Windows' `signal.Signals` has no SIGKILL,
+    so `Signals(9).name` is 'SIG9' there. Computing the expectation keeps these
+    tests asserting that the translation happened, on either platform.
+    """
+    try:
+        return signal_module.Signals(signum).name
+    except ValueError:
+        return f"SIG{signum}"
+
 
 def _make_manager() -> TerminalManager:
     """Create a TerminalManager with the running event loop."""
@@ -102,19 +116,19 @@ class TestSetExitStatus:
         info = _make_info()
         TerminalManager._set_exit_status(info, -9)
         assert info.exit_code is None
-        assert info.exit_signal == "SIGKILL"
+        assert info.exit_signal == _signame(9)
 
     async def test_negative_sigterm(self):
         info = _make_info()
         TerminalManager._set_exit_status(info, -15)
         assert info.exit_code is None
-        assert info.exit_signal == "SIGTERM"
+        assert info.exit_signal == _signame(15)
 
     async def test_negative_sigint(self):
         info = _make_info()
         TerminalManager._set_exit_status(info, -2)
         assert info.exit_code is None
-        assert info.exit_signal == "SIGINT"
+        assert info.exit_signal == _signame(2)
 
     async def test_negative_unknown_signal(self):
         info = _make_info()
@@ -133,7 +147,7 @@ class TestSetExitStatus:
         TerminalManager._set_exit_status(info, -9)
         TerminalManager._set_exit_status(info, -9)
         assert info.exit_code is None
-        assert info.exit_signal == "SIGKILL"
+        assert info.exit_signal == _signame(9)
 
 
 # ===================================================================
@@ -360,7 +374,7 @@ class TestTerminalOutput:
         resp = await mgr.terminal_output(session_id=SESSION, terminal_id="t1")
         assert resp.exit_status is not None
         assert resp.exit_status.exit_code is None
-        assert resp.exit_status.signal == "SIGKILL"
+        assert resp.exit_status.signal == _signame(9)
 
     async def test_invalid_terminal_raises(self):
         mgr = _make_manager()
@@ -399,7 +413,7 @@ class TestWaitForTerminalExit:
         mgr._terminals["t1"] = info
         resp = await mgr.wait_for_terminal_exit(session_id=SESSION, terminal_id="t1")
         assert resp.exit_code is None
-        assert resp.signal == "SIGTERM"
+        assert resp.signal == _signame(15)
 
 
 # ===================================================================
@@ -416,12 +430,15 @@ class TestKillTerminal:
         info.process.returncode = None
         mgr._terminals["t1"] = info
 
-        with patch("os.killpg") as mock_killpg, patch("os.getpgid", return_value=12345):
+        with patch(
+            "jupyter_ai_acp_client.terminal_manager.kill_process_tree",
+            new_callable=AsyncMock,
+        ) as mock_kill:
             await mgr.kill_terminal(session_id=SESSION, terminal_id="t1")
-            mock_killpg.assert_called_once_with(12345, signal_module.SIGKILL)
+            mock_kill.assert_awaited_once_with(info.process)
 
         assert info.exit_code is None
-        assert info.exit_signal == "SIGKILL"
+        assert info.exit_signal == _signame(9)
 
     async def test_kill_falls_back_on_lookup_error(self):
         mgr = _make_manager()
@@ -430,10 +447,16 @@ class TestKillTerminal:
         info.process.returncode = None
         mgr._terminals["t1"] = info
 
-        with patch("os.killpg", side_effect=ProcessLookupError), \
-             patch("os.getpgid", return_value=12345):
+        # kill_process_tree swallows the lookup error internally; the caller
+        # must still record the exit status rather than propagating it.
+        with patch(
+            "jupyter_ai_acp_client.terminal_manager.kill_process_tree",
+            new_callable=AsyncMock,
+        ) as mock_kill:
             await mgr.kill_terminal(session_id=SESSION, terminal_id="t1")
-            info.process.kill.assert_called_once()
+            mock_kill.assert_awaited_once_with(info.process)
+
+        assert info.exit_signal == _signame(9)
 
     async def test_kill_already_exited(self):
         mgr = _make_manager()
@@ -453,10 +476,13 @@ class TestKillTerminal:
         info.process.returncode = None
         mgr._terminals["t1"] = info
 
-        with patch("os.killpg"), patch("os.getpgid", return_value=12345):
+        with patch(
+            "jupyter_ai_acp_client.terminal_manager.kill_process_tree",
+            new_callable=AsyncMock,
+        ):
             await mgr.kill_terminal(session_id=SESSION, terminal_id="t1")
 
-        assert info.exit_signal == "SIGTERM"
+        assert info.exit_signal == _signame(15)
 
 
 # ===================================================================
@@ -484,9 +510,12 @@ class TestReleaseTerminal:
         info._output_task.done.return_value = True
         mgr._terminals["t1"] = info
 
-        with patch("os.killpg") as mock_killpg, patch("os.getpgid", return_value=12345):
+        with patch(
+            "jupyter_ai_acp_client.terminal_manager.kill_process_tree",
+            new_callable=AsyncMock,
+        ) as mock_kill:
             await mgr.release_terminal(session_id=SESSION, terminal_id="t1")
-            mock_killpg.assert_called_once()
+            mock_kill.assert_awaited_once_with(info.process)
 
         assert "t1" not in mgr._terminals
 
