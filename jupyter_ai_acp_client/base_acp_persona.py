@@ -1,10 +1,7 @@
 import asyncio
 import html
-import os
-import signal
 import sys
 from asyncio import Task
-from asyncio.subprocess import Process
 from typing import Any, ClassVar, Optional
 
 from acp import NewSessionResponse, LoadSessionResponse
@@ -28,6 +25,7 @@ from jupyter_ai_persona_manager import (
 from jupyter_ai_persona_manager import Usage as AwarenessUsage
 from jupyterlab_chat.models import FileAttachment, Message, NotebookAttachment
 
+from ._win32_subprocess import AnyProcess, create_subprocess, terminate_process
 from .default_acp_client import JaiAcpClient
 from .telemetry import emit_event, auto_emit_event
 
@@ -87,7 +85,7 @@ class BaseAcpPersona(BasePersona):
     `self.before_agent_subprocess()` - see method documentation for details.
     """
 
-    _subprocess_future: ClassVar[Task[Process] | None] = None
+    _subprocess_future: ClassVar[Task[AnyProcess] | None] = None
     """
     The task that yields the agent subprocess once complete. This is a class
     attribute because multiple instances of the same ACP persona may share an
@@ -221,7 +219,7 @@ class BaseAcpPersona(BasePersona):
 
     async def _init_agent_subprocess(
         self, env: Optional[dict[str, str]] = None
-    ) -> Process:
+    ) -> AnyProcess:
         # Wait until user is authenticated
         await self._before_subprocess_future
         self.log.info("Spawning ACP agent subprocess for '%s'.", self.__class__.__name__)
@@ -234,7 +232,7 @@ class BaseAcpPersona(BasePersona):
         )
         if env is not None:
             kwargs["env"] = env
-        process = await asyncio.create_subprocess_exec(*self._executable, **kwargs)
+        process = await create_subprocess(*self._executable, **kwargs)
         self.log.info("Spawned ACP agent subprocess for '%s'.", self.__class__.__name__)
         return process
 
@@ -500,7 +498,7 @@ class BaseAcpPersona(BasePersona):
             and (fut.cancelled() or fut.exception() is not None)
         )
 
-    async def get_agent_subprocess(self) -> asyncio.subprocess.Process:
+    async def get_agent_subprocess(self) -> AnyProcess:
         """Safely returns the ACP agent subprocess (spawned by `prepare()`)."""
         return await self.__class__._subprocess_future
 
@@ -1192,24 +1190,14 @@ class BaseAcpPersona(BasePersona):
                 exc_info=True,
             )
 
-        # Step 3: Stop the subprocess gracefully, falling back to SIGKILL
+        # Step 3: Stop the subprocess gracefully, falling back to a forced kill
         try:
             subprocess = await self.get_agent_subprocess()
-            pgid = os.getpgid(subprocess.pid)
-            os.killpg(pgid, signal.SIGINT)
-            os.killpg(pgid, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(subprocess.wait(), timeout=5.0)
-                self.log.info(
-                    "[shutdown] Step 3: subprocess terminated for '%s'.",
-                    self.__class__.__name__,
-                )
-            except asyncio.TimeoutError:
-                os.killpg(pgid, signal.SIGKILL)
-                self.log.info(
-                    "[shutdown] Step 3: subprocess killed after timeout for '%s'.",
-                    self.__class__.__name__,
-                )
+            await terminate_process(subprocess, timeout=5.0)
+            self.log.info(
+                "[shutdown] Step 3: subprocess terminated for '%s'.",
+                self.__class__.__name__,
+            )
         except asyncio.CancelledError:
             pass
         except (ProcessLookupError, PermissionError, OSError):

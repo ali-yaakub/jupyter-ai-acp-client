@@ -6,7 +6,6 @@ import os
 import shlex
 import signal as signal_module
 import uuid
-from asyncio.subprocess import Process
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,6 +18,13 @@ from acp.schema import (
     TerminalExitStatus,
     TerminalOutputResponse,
     WaitForTerminalExitResponse,
+)
+
+from ._win32_subprocess import (
+    IS_WINDOWS,
+    AnyProcess,
+    create_subprocess,
+    kill_process_tree,
 )
 
 log = logging.getLogger(__name__)
@@ -67,7 +73,7 @@ def _log_output_task_exception(task: asyncio.Task) -> None:
 class TerminalInfo:
     """Tracks state for a single terminal instance."""
 
-    process: Process
+    process: AnyProcess
     session_id: str
     output_buffer: bytearray = field(default_factory=bytearray)
     output_byte_limit: int | None = None
@@ -283,7 +289,9 @@ class TerminalManager:
             cmd_args = [command] + args
         else:
             try:
-                cmd_args = shlex.split(command)
+                # POSIX mode treats a backslash as an escape, so on Windows it
+                # silently eats path separators ('C:\Users' -> 'C:Users').
+                cmd_args = shlex.split(command, posix=not IS_WINDOWS)
             except ValueError as e:
                 raise RequestError.invalid_params(
                     {"command": f"could not parse command: {e}"}
@@ -293,7 +301,7 @@ class TerminalManager:
             raise RequestError.invalid_params({"command": "command cannot be empty"})
 
         try:
-            process = await asyncio.create_subprocess_exec(
+            process = await create_subprocess(
                 *cmd_args,
                 cwd=cwd,
                 env=env_dict,
@@ -393,13 +401,8 @@ class TerminalManager:
         info = self._validate_terminal(terminal_id, session_id)
 
         if info.process.returncode is None:
-            # Kill the entire process group so child processes are cleaned up.
-            try:
-                os.killpg(os.getpgid(info.process.pid), signal_module.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                # Process already exited or is inaccessible — fall back to
-                # direct kill which is a no-op if already dead.
-                info.process.kill()
+            # Kill the whole tree so child processes are cleaned up.
+            await kill_process_tree(info.process)
             exit_code = await info.process.wait()
             self._set_exit_status(info, exit_code)
 
@@ -417,10 +420,7 @@ class TerminalManager:
 
         # Kill process if still running
         if info.process.returncode is None:
-            try:
-                os.killpg(os.getpgid(info.process.pid), signal_module.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                info.process.kill()
+            await kill_process_tree(info.process)
             await info.process.wait()
 
         # Cancel the output reading task if it's still running
