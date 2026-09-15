@@ -338,19 +338,17 @@ async def terminate_process(
         return
 
     if IS_WINDOWS:
-        try:
-            process.terminate()
-        except (OSError, ValueError):
-            pass
+        # Order matters. An npm shim is `cmd.exe` wrapping `node`, and Windows
+        # does not re-parent or signal descendants: terminating the shim first
+        # orphans the agent, and once the shim has exited its pid no longer
+        # names a tree that `taskkill /T` can walk. So kill the whole tree
+        # while the shim is still alive, then reap it.
+        await kill_process_tree(process)
         try:
             await asyncio.wait_for(process.wait(), timeout=timeout)
-            # A terminated `cmd.exe` shim can leave `node` behind, so sweep the
-            # tree even on a clean exit.
-            await kill_process_tree(process)
-            return
         except asyncio.TimeoutError:
-            await kill_process_tree(process)
-            return
+            pass
+        return
 
     pgid = os.getpgid(process.pid)
     os.killpg(pgid, signal.SIGINT)

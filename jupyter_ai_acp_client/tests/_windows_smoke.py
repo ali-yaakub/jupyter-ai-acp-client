@@ -18,14 +18,32 @@ Exits non-zero on failure.
 
 import asyncio
 import os
+import subprocess
 import sys
 
 from acp import PROTOCOL_VERSION, connect_to_agent
 from acp.schema import ClientCapabilities, FileSystemCapabilities
 
-from jupyter_ai_acp_client._win32_subprocess import create_subprocess
+from jupyter_ai_acp_client._win32_subprocess import create_subprocess, terminate_process
 
 AGENT = "claude-agent-acp"
+
+
+def _descendant_node_pids() -> set[int]:
+    """PIDs of running `node` processes belonging to an ACP adapter."""
+    out = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\""
+            " | Where-Object { $_.CommandLine -like '*acp*' }"
+            " | ForEach-Object { $_.ProcessId }",
+        ],
+        capture_output=True,
+        text=True,
+    ).stdout
+    return {int(line) for line in out.split() if line.strip().isdigit()}
 
 
 class _NullClient:
@@ -72,6 +90,8 @@ async def main() -> None:
         "expected a SelectorEventLoop; this test is meaningless on a Proactor loop"
     )
 
+    before = _descendant_node_pids()
+
     proc = await create_subprocess(
         AGENT,
         stdin=asyncio.subprocess.PIPE,
@@ -95,9 +115,30 @@ async def main() -> None:
             timeout=120,
         )
         print("ACP initialize OK; protocol version", response.protocol_version)
+
+        spawned = _descendant_node_pids() - before
+        assert spawned, "expected the `.cmd` shim to have started a node agent"
+        print("agent node pid(s):", sorted(spawned))
     finally:
-        proc.kill()
-        await proc.wait()
+        # Close the connection first so the SDK's reader/sender tasks stop
+        # cleanly, then terminate. The adapter runs as `cmd.exe` -> `node`, so
+        # this is the real test of tree termination: killing the shim alone
+        # would leave node orphaned.
+        try:
+            await asyncio.wait_for(conn.close(), timeout=10)
+        except Exception:
+            pass
+        await terminate_process(proc, timeout=15)
+
+    for _ in range(50):
+        survivors = _descendant_node_pids() & spawned
+        if not survivors:
+            break
+        await asyncio.sleep(0.2)
+    assert not survivors, "orphaned agent process(es) after shutdown: %s" % sorted(
+        survivors
+    )
+    print("process tree terminated cleanly; no orphaned agents")
 
 
 if __name__ == "__main__":

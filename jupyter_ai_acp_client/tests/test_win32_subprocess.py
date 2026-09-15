@@ -20,6 +20,7 @@ from jupyter_ai_acp_client._win32_subprocess import (
     WindowsProcess,
     create_subprocess,
     resolve_executable,
+    terminate_process,
 )
 
 windows_only = pytest.mark.skipif(not IS_WINDOWS, reason="Windows-specific behaviour")
@@ -34,6 +35,16 @@ ECHO_SCRIPT = (
 
 # Writes one newline-terminated line, then stays alive so a reader that waits
 # for a *full* buffer rather than a line will visibly block.
+# Spawns a child of its own, reports the child's pid, then idles — standing in
+# for the `cmd.exe` -> `node` shape of an npm-installed ACP adapter.
+SPAWNER_SCRIPT = (
+    "import subprocess, sys, time\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+    "sys.stdout.buffer.write(str(child.pid).encode() + b'\\n')\n"
+    "sys.stdout.buffer.flush()\n"
+    "time.sleep(300)\n"
+)
+
 SLOW_SCRIPT = (
     "import sys, time\n"
     "sys.stdout.buffer.write(b'first\\n')\n"
@@ -253,6 +264,61 @@ class TestSelectorEventLoopFallback:
             )
             assert await asyncio.wait_for(proc.wait(), 30) == 3
             assert proc.returncode == 3
+
+        try:
+            loop.run_until_complete(go())
+        finally:
+            loop.close()
+
+
+@windows_only
+class TestTreeTermination:
+    """
+    Regression test for orphaned agents.
+
+    An npm shim is `cmd.exe` wrapping `node`, so the real agent is a
+    *grandchild* of what we spawned. Windows neither re-parents nor signals
+    descendants, so terminating the direct child leaves the agent running.
+    This was observable as a `node.exe` surviving a JupyterLab shutdown.
+    """
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        out = subprocess.run(
+            ["tasklist", "/FI", "PID eq %d" % pid],
+            capture_output=True,
+            text=True,
+        ).stdout
+        return str(pid) in out
+
+    def test_terminate_process_kills_the_grandchild(self):
+        loop = asyncio.SelectorEventLoop()
+
+        async def go():
+            proc = await create_subprocess(
+                sys.executable,
+                "-u",
+                "-c",
+                SPAWNER_SCRIPT,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=sys.stderr,
+            )
+            line = await asyncio.wait_for(proc.stdout.readuntil(b"\n"), 30)
+            grandchild = int(line.strip())
+            assert self._alive(grandchild), "grandchild never started"
+
+            await terminate_process(proc, timeout=15)
+
+            # Windows reaps asynchronously; give it a moment to settle.
+            for _ in range(50):
+                if not self._alive(grandchild):
+                    break
+                await asyncio.sleep(0.1)
+            assert not self._alive(grandchild), (
+                "grandchild %d survived termination; the process tree was not "
+                "killed while the direct child was still alive" % grandchild
+            )
 
         try:
             loop.run_until_complete(go())
