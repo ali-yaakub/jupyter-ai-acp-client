@@ -25,7 +25,12 @@ from jupyter_ai_persona_manager import (
 from jupyter_ai_persona_manager import Usage as AwarenessUsage
 from jupyterlab_chat.models import FileAttachment, Message, NotebookAttachment
 
-from ._win32_subprocess import AnyProcess, create_subprocess, terminate_process
+from ._win32_subprocess import (
+    DEFAULT_STREAM_LIMIT,
+    AnyProcess,
+    create_subprocess,
+    terminate_process,
+)
 from .default_acp_client import JaiAcpClient
 from .telemetry import emit_event, auto_emit_event
 
@@ -227,7 +232,7 @@ class BaseAcpPersona(BasePersona):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr,
-            limit=50 * 1024 * 1024,
+            limit=DEFAULT_STREAM_LIMIT,
             start_new_session=True,
         )
         if env is not None:

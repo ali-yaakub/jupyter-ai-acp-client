@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import shlex
 import signal as signal_module
 import uuid
 from dataclasses import dataclass, field
@@ -21,10 +20,10 @@ from acp.schema import (
 )
 
 from ._win32_subprocess import (
-    IS_WINDOWS,
     AnyProcess,
     create_subprocess,
     kill_process_tree,
+    split_command,
 )
 
 log = logging.getLogger(__name__)
@@ -289,9 +288,7 @@ class TerminalManager:
             cmd_args = [command] + args
         else:
             try:
-                # POSIX mode treats a backslash as an escape, so on Windows it
-                # silently eats path separators ('C:\Users' -> 'C:Users').
-                cmd_args = shlex.split(command, posix=not IS_WINDOWS)
+                cmd_args = split_command(command)
             except ValueError as e:
                 raise RequestError.invalid_params(
                     {"command": f"could not parse command: {e}"}

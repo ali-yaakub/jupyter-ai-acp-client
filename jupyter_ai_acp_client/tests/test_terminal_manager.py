@@ -14,6 +14,7 @@ Covers:
 
 import asyncio
 import signal as signal_module
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -31,6 +32,22 @@ from jupyter_ai_acp_client.terminal_manager import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+@contextmanager
+def _as_posix():
+    """
+    Run the POSIX termination branch on any platform.
+
+    Windows genuinely lacks `os.killpg`, `os.getpgid` and `signal.SIGKILL`, so
+    without this the POSIX path — the one the project's Linux CI actually runs
+    — could only be tested on POSIX, and would go uncovered on the machines
+    where this package's Windows work gets done.
+    """
+    with patch("jupyter_ai_acp_client._win32_subprocess.IS_WINDOWS", False), patch(
+        "os.getpgid", create=True, return_value=12345
+    ), patch("signal.SIGKILL", 9, create=True):
+        yield
+
 
 def _signame(signum: int) -> str:
     """
@@ -441,20 +458,26 @@ class TestKillTerminal:
         assert info.exit_signal == _signame(9)
 
     async def test_kill_falls_back_on_lookup_error(self):
+        """
+        A process that vanishes between the group lookup and the kill must
+        still be reaped, via the direct-kill fallback.
+
+        This drives the real `kill_process_tree` rather than mocking it, since
+        the fallback is the whole point of the test. `IS_WINDOWS` is forced
+        false so the POSIX branch runs on any platform — on Windows `os.killpg`
+        does not otherwise exist.
+        """
         mgr = _make_manager()
         info = _make_info(returncode=None)
         info.process.wait = AsyncMock(return_value=-9)
         info.process.returncode = None
         mgr._terminals["t1"] = info
 
-        # kill_process_tree swallows the lookup error internally; the caller
-        # must still record the exit status rather than propagating it.
-        with patch(
-            "jupyter_ai_acp_client.terminal_manager.kill_process_tree",
-            new_callable=AsyncMock,
-        ) as mock_kill:
+        with _as_posix(), patch(
+            "os.killpg", create=True, side_effect=ProcessLookupError
+        ):
             await mgr.kill_terminal(session_id=SESSION, terminal_id="t1")
-            mock_kill.assert_awaited_once_with(info.process)
+            info.process.kill.assert_called_once()
 
         assert info.exit_signal == _signame(9)
 

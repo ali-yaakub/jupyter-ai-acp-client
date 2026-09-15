@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import queue
+import shlex
 import shutil
 import signal
 import subprocess
@@ -78,6 +79,33 @@ def resolve_executable(argv: Iterable[str]) -> list[str]:
     if resolved:
         args[0] = resolved
     return args
+
+
+def split_command(command: str) -> list[str]:
+    """
+    Split a shell-style command string into argv, honouring platform quoting.
+
+    `shlex.split` defaults to POSIX rules, where a backslash escapes the next
+    character. On Windows that silently destroys paths: `dir C:\\Users` splits
+    to `['dir', 'C:Users']`.
+
+    Passing `posix=False` is not the fix. It keeps backslashes, but leaves the
+    grouping quotes attached to the token (`'"C:\\Program Files\\app.exe"'`,
+    which will not launch) and stops recognising a quote that begins mid-token,
+    so `--opt="a b"` splits into `['--opt="a', 'b"']`.
+
+    Instead keep POSIX quoting — which strips grouping quotes and keeps quoted
+    spans together — and simply remove backslash from the escape characters,
+    since on Windows it is a path separator. Raises `ValueError` on unbalanced
+    quotes, like `shlex.split`.
+    """
+    if not IS_WINDOWS:
+        return shlex.split(command)
+
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    return list(lexer)
 
 
 async def create_subprocess(*argv: str, **kwargs: Any) -> AnyProcess:
@@ -223,10 +251,17 @@ class WindowsProcess:
     """
     An `asyncio.subprocess.Process` work-alike backed by `subprocess.Popen`.
 
-    `stdout` is a genuine `asyncio.StreamReader`, which matters because the
-    ACP SDK drives it with `readuntil(b"...")` and `readexactly(n)` and relies
-    on their buffering semantics. Reproducing those correctly by hand is not
-    worth it when the real class works once data is fed in from a thread.
+    The streams are genuine `asyncio.StreamReader`/`StreamWriter` because
+    `ClientSideConnection.__init__` requires them literally:
+
+        if not isinstance(input_stream, asyncio.StreamWriter) or not isinstance(
+            output_stream, asyncio.StreamReader
+        ):
+            raise TypeError(_CLIENT_CONNECTION_ERROR)
+
+    A duck-typed work-alike is therefore rejected outright, not merely
+    inconvenient. Feeding the real classes from a reader thread is the way to
+    satisfy that check without a subprocess-capable event loop.
     """
 
     def __init__(

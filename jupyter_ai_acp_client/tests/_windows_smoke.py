@@ -17,7 +17,6 @@ Exits non-zero on failure.
 """
 
 import asyncio
-import os
 import subprocess
 import sys
 

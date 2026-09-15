@@ -110,8 +110,11 @@ pip uninstall jupyter_ai_acp_client
 
 ## Windows
 
-ACP personas work on Windows with no extra configuration. Two Windows-specific
-problems used to make every persona fail, and both are handled by the extension:
+ACP personas need no extra configuration on Windows. Two Windows-specific
+problems used to make every persona fail before its agent could start, and both
+are handled by the extension. `@Claude` and `@Codex` have been verified
+end to end on Windows; the other personas share this same startup path but have
+not been individually exercised there.
 
 - **The event loop.** `jupyter_server` runs the server on a `SelectorEventLoop`
   on Windows, which cannot create subprocesses at all — spawning an agent raised
@@ -136,9 +139,8 @@ the same lookup the extension performs:
 python -c "import shutil; print(shutil.which('claude-agent-acp'))"
 ```
 
-An empty result means the adapter is not on `PATH`. Reinstall it using the
-command listed for that persona above, then restart JupyterLab so the server
-picks up the new `PATH`.
+An empty result means the adapter is not on `PATH`. Reinstall that persona's
+adapter, then restart JupyterLab so the server picks up the new `PATH`.
 
 ## Troubleshoot
 

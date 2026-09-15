@@ -53,10 +53,6 @@ jobs:
       #   1. SelectorEventLoop cannot spawn subprocesses (NotImplementedError)
       #   2. CreateProcessW only resolves `.exe`, so npm shims are invisible
       #      to a bare command name (FileNotFoundError: [WinError 2])
-      # NOTE: the README still points users at `@zed-industries/*`, which is
-      # many versions behind the `@agentclientprotocol/*` packages the adapters
-      # now ship under. That rename is a separate change; this job pins the
-      # current package so the smoke test runs against a maintained adapter.
       - name: Install an ACP adapter
         run: npm install -g @agentclientprotocol/claude-agent-acp
 

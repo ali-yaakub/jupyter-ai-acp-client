@@ -9,9 +9,12 @@ every ACP persona unusable on Windows: `jupyter_server` runs the server on a
 """
 
 import asyncio
+import signal
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -19,7 +22,9 @@ from jupyter_ai_acp_client._win32_subprocess import (
     IS_WINDOWS,
     WindowsProcess,
     create_subprocess,
+    kill_process_tree,
     resolve_executable,
+    split_command,
     terminate_process,
 )
 
@@ -33,8 +38,6 @@ ECHO_SCRIPT = (
     "    sys.stdout.buffer.flush()\n"
 )
 
-# Writes one newline-terminated line, then stays alive so a reader that waits
-# for a *full* buffer rather than a line will visibly block.
 # Spawns a child of its own, reports the child's pid, then idles — standing in
 # for the `cmd.exe` -> `node` shape of an npm-installed ACP adapter.
 SPAWNER_SCRIPT = (
@@ -45,6 +48,8 @@ SPAWNER_SCRIPT = (
     "time.sleep(300)\n"
 )
 
+# Writes one newline-terminated line, then stays alive, so a reader that waits
+# for a *full* buffer rather than a line will visibly block.
 SLOW_SCRIPT = (
     "import sys, time\n"
     "sys.stdout.buffer.write(b'first\\n')\n"
@@ -269,6 +274,124 @@ class TestSelectorEventLoopFallback:
             loop.run_until_complete(go())
         finally:
             loop.close()
+
+
+class TestSplitCommand:
+    """
+    Command splitting has to survive Windows path separators *and* quoting.
+
+    `posix=True` eats backslashes; `posix=False` keeps them but leaves grouping
+    quotes attached and mis-splits a quote that starts mid-token. These assert
+    the combination that gets both right.
+    """
+
+    def test_plain_command(self):
+        assert split_command("ls -la") == ["ls", "-la"]
+
+    def test_strips_grouping_quotes(self):
+        assert split_command('echo "hello world"') == ["echo", "hello world"]
+
+    def test_quote_starting_mid_token(self):
+        assert split_command('--opt="a b"') == ["--opt=a b"]
+
+    def test_empty_quoted_argument_survives(self):
+        assert split_command('git commit -m ""') == ["git", "commit", "-m", ""]
+
+    def test_unbalanced_quote_raises_value_error(self):
+        with pytest.raises(ValueError):
+            split_command('echo "unterminated')
+
+    @windows_only
+    def test_windows_path_keeps_backslashes(self):
+        assert split_command(r"dir C:\Users") == ["dir", r"C:\Users"]
+
+    @windows_only
+    def test_windows_quoted_path_with_spaces(self):
+        """The commonest Windows case: a quoted program path containing a space."""
+        assert split_command(r'"C:\Program Files\app.exe" --flag') == [
+            r"C:\Program Files\app.exe",
+            "--flag",
+        ]
+
+    @pytest.mark.skipif(IS_WINDOWS, reason="POSIX-specific")
+    def test_posix_escaping_is_unchanged(self):
+        """On POSIX a backslash still escapes, exactly as `shlex.split` does."""
+        assert split_command(r"echo a\ b") == ["echo", "a b"]
+
+
+class TestPosixTermination:
+    """
+    The POSIX termination paths, exercised on any platform.
+
+    These run on the maintainers' Linux CI in production but are otherwise
+    untestable from a Windows machine, since Windows lacks `os.killpg`,
+    `os.getpgid` and `signal.SIGKILL` entirely.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _as_posix():
+        with patch(
+            "jupyter_ai_acp_client._win32_subprocess.IS_WINDOWS", False
+        ), patch("os.getpgid", create=True, return_value=999), patch(
+            "signal.SIGKILL", 9, create=True
+        ):
+            yield
+
+    @staticmethod
+    def _proc(wait_result=0, hangs=False):
+        proc = MagicMock()
+        proc.returncode = None
+        if hangs:
+            async def _never():
+                await asyncio.sleep(3600)
+            proc.wait = _never
+        else:
+            proc.wait = AsyncMock(return_value=wait_result)
+        return proc
+
+    async def test_kill_process_tree_uses_the_process_group(self):
+        proc = self._proc()
+        with self._as_posix(), patch("os.killpg", create=True) as killpg:
+            await kill_process_tree(proc)
+        killpg.assert_called_once_with(999, 9)
+        proc.kill.assert_not_called()
+
+    async def test_kill_process_tree_falls_back_when_group_is_gone(self):
+        proc = self._proc()
+        with self._as_posix(), patch(
+            "os.killpg", create=True, side_effect=ProcessLookupError
+        ):
+            await kill_process_tree(proc)
+        proc.kill.assert_called_once()
+
+    async def test_terminate_sends_sigint_then_sigterm(self):
+        proc = self._proc()
+        with self._as_posix(), patch("os.killpg", create=True) as killpg:
+            await terminate_process(proc, timeout=5)
+        assert [c.args for c in killpg.call_args_list] == [
+            (999, signal.SIGINT),
+            (999, signal.SIGTERM),
+        ]
+
+    async def test_terminate_escalates_to_sigkill_on_timeout(self):
+        proc = self._proc(hangs=True)
+        with self._as_posix(), patch("os.killpg", create=True) as killpg:
+            await terminate_process(proc, timeout=0.1)
+        assert [c.args for c in killpg.call_args_list] == [
+            (999, signal.SIGINT),
+            (999, signal.SIGTERM),
+            (999, 9),
+        ]
+
+    async def test_already_exited_process_is_left_alone(self):
+        proc = self._proc()
+        proc.returncode = 0
+        with self._as_posix(), patch("os.killpg", create=True) as killpg:
+            await terminate_process(proc)
+            await kill_process_tree(proc)
+        killpg.assert_not_called()
+        proc.kill.assert_not_called()
 
 
 @windows_only
